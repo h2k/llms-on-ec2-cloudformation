@@ -1,0 +1,66 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Ultra-minimal: tiny VPC + 1 EC2 (CPU) running Hugging Face TGI (CPU-only image) on :8080 with health-wait.",
+  "Parameters": {
+    "InstanceType": { "Type": "String", "Default": "t3.large", "Description": "CPU instance." },
+    "ModelId": { "Type": "String", "Default": "sshleifer/tiny-gpt2", "Description": "Tiny HF model for smoke test." },
+    "AllowedCidr": { "Type": "String", "Default": "0.0.0.0/0", "Description": "CIDR allowed to hit port 8080." },
+    "VolumeSizeGiB": { "Type": "Number", "Default": 50, "MinValue": 20, "Description": "Root volume size." }
+  },
+  "Resources": {
+    "Vpc": { "Type": "AWS::EC2::VPC", "Properties": { "CidrBlock": "10.9.0.0/16", "EnableDnsSupport": true, "EnableDnsHostnames": true } },
+    "Igw": { "Type": "AWS::EC2::InternetGateway" },
+    "VpcIgwAttach": { "Type": "AWS::EC2::VPCGatewayAttachment", "Properties": { "InternetGatewayId": { "Ref": "Igw" }, "VpcId": { "Ref": "Vpc" } } },
+    "PublicSubnet": { "Type": "AWS::EC2::Subnet", "Properties": { "VpcId": { "Ref": "Vpc" }, "CidrBlock": "10.9.1.0/24", "MapPublicIpOnLaunch": true } },
+    "RouteTable": { "Type": "AWS::EC2::RouteTable", "Properties": { "VpcId": { "Ref": "Vpc" } } },
+    "DefaultRoute": { "Type": "AWS::EC2::Route", "DependsOn": "VpcIgwAttach", "Properties": { "RouteTableId": { "Ref": "RouteTable" }, "DestinationCidrBlock": "0.0.0.0/0", "GatewayId": { "Ref": "Igw" } } },
+    "RtAssoc": { "Type": "AWS::EC2::SubnetRouteTableAssociation", "Properties": { "SubnetId": { "Ref": "PublicSubnet" }, "RouteTableId": { "Ref": "RouteTable" } } },
+    "ApiSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "VpcId": { "Ref": "Vpc" },
+        "GroupDescription": "Allow TCP/8080 (and 22 if needed).",
+        "SecurityGroupIngress": [
+          { "IpProtocol": "tcp", "FromPort": 8080, "ToPort": 8080, "CidrIp": { "Ref": "AllowedCidr" } },
+          { "IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "CidrIp": { "Ref": "AllowedCidr" } }
+        ]
+      }
+    },
+    "InstanceProfileRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": { "Version": "2012-10-17", "Statement": [{ "Effect": "Allow", "Principal": { "Service": "ec2.amazonaws.com" }, "Action": "sts:AssumeRole" }] },
+        "ManagedPolicyArns": [ "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" ]
+      }
+    },
+    "InstanceProfile": { "Type": "AWS::IAM::InstanceProfile", "Properties": { "Roles": [{ "Ref": "InstanceProfileRole" }] } },
+    "Server": {
+      "Type": "AWS::EC2::Instance",
+      "Properties": {
+        "IamInstanceProfile": { "Ref": "InstanceProfile" },
+        "InstanceType": { "Ref": "InstanceType" },
+        "SubnetId": { "Ref": "PublicSubnet" },
+        "SecurityGroupIds": [{ "Ref": "ApiSecurityGroup" }],
+        "BlockDeviceMappings": [
+          { "DeviceName": "/dev/xvda", "Ebs": { "VolumeSize": { "Ref": "VolumeSizeGiB" }, "VolumeType": "gp3", "DeleteOnTermination": true } }
+        ],
+        "ImageId": { "Fn::Sub": "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}" },
+        "UserData": {
+          "Fn::Base64": {
+            "Fn::Sub": "#!/bin/bash\nset -euxo pipefail\n# Basics + Docker (Amazon Linux 2)\nyum clean all -y || true\nyum update -y || true\namazon-linux-extras install docker -y\nsystemctl enable --now docker\n# Ensure SSM agent\nsystemctl enable --now amazon-ssm-agent || true\n# Run TGI CPU-only image with tiny model\nMODEL_ID=\"${ModelId}\"\nmkdir -p /opt/tgi-cache\n/usr/bin/docker run -d --name tgi --restart unless-stopped \\\n  -p 8080:80 \\\n  -v /opt/tgi-cache:/data \\\n  -e HF_HUB_ENABLE_HF_TRANSFER=1 \\\n  ghcr.io/huggingface/text-generation-inference:latest-intel-cpu \\\n    --model-id \"$MODEL_ID\" \\\n    --hostname 0.0.0.0 \\\n    --port 80\n# Wait for health\nfor i in {1..60}; do\n  sleep 5\n  if curl -fsS http://localhost:8080/health >/dev/null; then\n    echo \"TGI is healthy\"; exit 0\n  fi\n  echo \"waiting for TGI... ($i)\"\ndone\n# If we get here, health never passed; dump logs to help debugging and still exit 0 so CFN completes\n/usr/bin/docker logs --tail=200 tgi || true\nexit 0\n"
+          }
+        },
+        "Tags": [{ "Key": "Name", "Value": "hf-tgi-minimal" }]
+      }
+    },
+    "Eip": { "Type": "AWS::EC2::EIP", "Properties": { "Domain": "vpc", "InstanceId": { "Ref": "Server" } } }
+  },
+  "Outputs": {
+    "PublicIp": { "Description": "Instance public IP", "Value": { "Fn::GetAtt": [ "Eip", "PublicIp" ] } },
+    "ApiURL": { "Description": "HTTP base for the API", "Value": { "Fn::Sub": "http://${Eip.PublicIp}:8080" } },
+    "TestCurl": {
+      "Description": "Quick test",
+      "Value": { "Fn::Sub": "curl -s http://${Eip.PublicIp}:8080/generate -H \"Content-Type: application/json\" -d '{\"inputs\":\"Say hello from Manama.\",\"parameters\":{\"max_new_tokens\":32}}'" }
+    }
+  }
+}

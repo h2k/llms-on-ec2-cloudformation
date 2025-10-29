@@ -1,0 +1,163 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Minimal GPU Spot: tiny VPC + 1 g5.xlarge Spot instance using latest DLAMI (GPU Ubuntu), runs TGI CUDA on :8080 with health-wait.",
+  "Parameters": {
+    "InstanceType": { "Type": "String", "Default": "g5.xlarge", "Description": "GPU instance type." },
+    "ModelId": { "Type": "String", "Default": "mistralai/Mistral-7B-Instruct-v0.2", "Description": "HF model id to serve." },
+    "AllowedCidr": { "Type": "String", "Default": "0.0.0.0/0", "Description": "CIDR allowed to access port 8080." },
+    "VolumeSizeGiB": { "Type": "Number", "Default": 200, "MinValue": 50, "Description": "Root volume size (GiB) for model/cache." },
+    "SpotMaxPrice": { "Type": "String", "Default": "", "Description": "Optional Spot max $/hr (blank = market price)." }
+  },
+  "Conditions": {
+    "HasSpotMaxPrice": { "Fn::Not": [ { "Fn::Equals": [ { "Ref": "SpotMaxPrice" }, "" ] } ] }
+  },
+  "Resources": {
+    "Vpc": {
+      "Type": "AWS::EC2::VPC",
+      "Properties": { "CidrBlock": "10.9.0.0/16", "EnableDnsSupport": true, "EnableDnsHostnames": true }
+    },
+    "Igw": { "Type": "AWS::EC2::InternetGateway" },
+    "VpcIgwAttach": {
+      "Type": "AWS::EC2::VPCGatewayAttachment",
+      "Properties": { "InternetGatewayId": { "Ref": "Igw" }, "VpcId": { "Ref": "Vpc" } }
+    },
+    "PublicSubnet": {
+      "Type": "AWS::EC2::Subnet",
+      "Properties": { "VpcId": { "Ref": "Vpc" }, "CidrBlock": "10.9.1.0/24", "MapPublicIpOnLaunch": true }
+    },
+    "RouteTable": { "Type": "AWS::EC2::RouteTable", "Properties": { "VpcId": { "Ref": "Vpc" } } },
+    "DefaultRoute": {
+      "Type": "AWS::EC2::Route",
+      "DependsOn": "VpcIgwAttach",
+      "Properties": { "RouteTableId": { "Ref": "RouteTable" }, "DestinationCidrBlock": "0.0.0.0/0", "GatewayId": { "Ref": "Igw" } }
+    },
+    "RtAssoc": {
+      "Type": "AWS::EC2::SubnetRouteTableAssociation",
+      "Properties": { "SubnetId": { "Ref": "PublicSubnet" }, "RouteTableId": { "Ref": "RouteTable" } }
+    },
+
+    "ApiSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "VpcId": { "Ref": "Vpc" },
+        "GroupDescription": "Allow TCP/8080 (and 22 if you later add SSH).",
+        "SecurityGroupIngress": [
+          { "IpProtocol": "tcp", "FromPort": 8080, "ToPort": 8080, "CidrIp": { "Ref": "AllowedCidr" } },
+          { "IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "CidrIp": { "Ref": "AllowedCidr" } }
+        ]
+      }
+    },
+
+    "InstanceProfileRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [ { "Effect": "Allow", "Principal": { "Service": "ec2.amazonaws.com" }, "Action": "sts:AssumeRole" } ]
+        },
+        "ManagedPolicyArns": [ "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" ]
+      }
+    },
+    "InstanceProfile": { "Type": "AWS::IAM::InstanceProfile", "Properties": { "Roles": [ { "Ref": "InstanceProfileRole" } ] } },
+
+    "AmiLookupFnRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [ { "Effect": "Allow", "Principal": { "Service": "lambda.amazonaws.com" }, "Action": "sts:AssumeRole" } ]
+        },
+        "ManagedPolicyArns": [ "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole" ],
+        "Policies": [
+          {
+            "PolicyName": "DescribeImages",
+            "PolicyDocument": { "Version": "2012-10-17", "Statement": [ { "Effect": "Allow", "Action": "ec2:DescribeImages", "Resource": "*" } ] }
+          }
+        ]
+      }
+    },
+    "AmiLookupFn": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "Runtime": "python3.12",
+        "Handler": "index.handler",
+        "Role": { "Fn::GetAtt": [ "AmiLookupFnRole", "Arn" ] },
+        "Timeout": 60,
+        "Code": {
+          "ZipFile": "import boto3, json, urllib3\nec2=boto3.client('ec2')\nhttp=urllib3.PoolManager()\n\ndef latest_dlami_gpu_ubuntu():\n    resp=ec2.describe_images(Owners=['amazon'], Filters=[\n        {'Name':'name','Values':['Deep Learning AMI GPU * Ubuntu *']},\n        {'Name':'state','Values':['available']}\n    ])\n    imgs=resp.get('Images',[])\n    if not imgs: raise Exception('No DLAMI GPU Ubuntu images found')\n    imgs.sort(key=lambda x:x['CreationDate'])\n    return imgs[-1]['ImageId']\n\ndef handler(event,ctx):\n    req=event.get('RequestType','Create')\n    if req in ('Create','Update'): data={'AmiId': latest_dlami_gpu_ubuntu()}\n    else: data={'AmiId':''}\n    body=json.dumps({'Status':'SUCCESS','Reason':'OK','PhysicalResourceId':'LatestDlAmi','StackId':event['StackId'],'RequestId':event['RequestId'],'LogicalResourceId':event['LogicalResourceId'],'Data':data})\n    http.request('PUT', event['ResponseURL'], body=body)\n    return data\n"
+        }
+      }
+    },
+    "LatestDlAmi": {
+      "Type": "Custom::LatestAmi",
+      "Properties": { "ServiceToken": { "Fn::GetAtt": [ "AmiLookupFn", "Arn" ] } }
+    },
+
+    "LaunchTemplate": {
+      "Type": "AWS::EC2::LaunchTemplate",
+      "Properties": {
+        "LaunchTemplateName": { "Fn::Join": [ "", [ { "Ref": "AWS::StackName" }, "-lt" ] ] },
+        "LaunchTemplateData": {
+          "ImageId": { "Fn::GetAtt": [ "LatestDlAmi", "AmiId" ] },
+          "InstanceType": { "Ref": "InstanceType" },
+          "IamInstanceProfile": { "Arn": { "Fn::GetAtt": [ "InstanceProfile", "Arn" ] } },
+          "InstanceMarketOptions": {
+            "MarketType": "spot",
+            "SpotOptions": {
+              "InstanceInterruptionBehavior": "terminate",
+              "MaxPrice": { "Fn::If": [ "HasSpotMaxPrice", { "Ref": "SpotMaxPrice" }, { "Ref": "AWS::NoValue" } ] }
+            }
+          },
+          "BlockDeviceMappings": [
+            { "DeviceName": "/dev/xvda", "Ebs": { "VolumeSize": { "Ref": "VolumeSizeGiB" }, "VolumeType": "gp3", "DeleteOnTermination": true } }
+          ],
+          "NetworkInterfaces": [
+            {
+              "DeviceIndex": 0,
+              "AssociatePublicIpAddress": true,
+              "SubnetId": { "Ref": "PublicSubnet" },
+              "Groups": [ { "Ref": "ApiSecurityGroup" } ]
+            }
+          ],
+          "TagSpecifications": [
+            { "ResourceType": "instance", "Tags": [ { "Key": "Name", "Value": { "Fn::Join": [ "", [ { "Ref": "AWS::StackName" }, "-gpu-spot" ] ] } } ] }
+          ],
+          "UserData": {
+            "Fn::Base64": "#!/bin/bash\nset -euxo pipefail\n# Install Docker + NVIDIA container toolkit on DLAMI Ubuntu\nexport DEBIAN_FRONTEND=noninteractive\napt-get update\napt-get install -y docker.io curl jq gnupg ca-certificates\nsystemctl enable --now docker || true\n# Build distribution string without CFN-conflicting ${...}\ndistribution=$(. /etc/os-release; echo $ID$VERSION_ID)\n# NVIDIA repo\ncurl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg\ncurl -fsSL https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | tee /etc/apt/sources.list.d/nvidia-container-toolkit.list\napt-get update\napt-get install -y nvidia-container-toolkit\nnvidia-ctk runtime configure --runtime=docker || true\nsystemctl restart docker || true\n# Run TGI CUDA image on GPU\nMODEL_ID=\"${ModelId}\"\nmkdir -p /opt/tgi-cache\n/usr/bin/docker run -d --name tgi --restart unless-stopped --gpus all \\\n  -p 8080:80 \\\n  -v /opt/tgi-cache:/data \\\n  -e HF_HUB_ENABLE_HF_TRANSFER=1 \\\n  -e MODEL_ID=\"$MODEL_ID\" \\\n  ghcr.io/huggingface/text-generation-inference:latest \\\n    --model-id \"$MODEL_ID\" \\\n    --json-output \\\n    --hostname 0.0.0.0 \\\n    --port 80\n# Wait for health (~5 min)\nfor i in {1..60}; do\n  sleep 5\n  if curl -fsS http://localhost:8080/health >/dev/null; then\n    echo \"TGI is healthy\"; exit 0\n  fi\n  echo \"waiting for TGI... ($i)\"\ndone\n/usr/bin/docker logs --tail=200 tgi || true\nexit 0\n"
+          }
+        }
+      }
+    },
+
+    "Server": {
+      "Type": "AWS::EC2::Instance",
+      "Properties": {
+        "LaunchTemplate": {
+          "LaunchTemplateId": { "Ref": "LaunchTemplate" },
+          "Version": { "Fn::GetAtt": [ "LaunchTemplate", "LatestVersionNumber" ] }
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "InstanceId": { "Description": "EC2 instance id", "Value": { "Ref": "Server" } },
+    "PublicIp": { "Description": "Public IP", "Value": { "Fn::GetAtt": [ "Server", "PublicIp" ] } },
+    "ApiURL": {
+      "Description": "HTTP base for the API",
+      "Value": { "Fn::Join": [ "", [ "http://", { "Fn::GetAtt": [ "Server", "PublicIp" ] }, ":8080" ] ] }
+    },
+    "TestCurl": {
+      "Description": "Quick test",
+      "Value": {
+        "Fn::Join": [
+          "",
+          [
+            "curl -s http://",
+            { "Fn::GetAtt": [ "Server", "PublicIp" ] },
+            ":8080/generate -H \"Content-Type: application/json\" -d '{\"inputs\":\"Say hello from Manama.\",\"parameters\":{\"max_new_tokens\":64}}'"
+          ]
+        ]
+      }
+    }
+  }
+}

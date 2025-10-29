@@ -1,0 +1,120 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Ultra-minimal: VPC + 1 Spot instance via ASG using TGI CPU-only image on :8080.",
+  "Parameters": {
+    "InstanceType": { "Type": "String", "Default": "t3.large", "Description": "CPU instance type." },
+    "ModelId": { "Type": "String", "Default": "sshleifer/tiny-gpt2", "Description": "Tiny HF model for smoke test." },
+    "AllowedCidr": { "Type": "String", "Default": "0.0.0.0/0", "Description": "CIDR allowed to hit port 8080." },
+    "VolumeSizeGiB": { "Type": "Number", "Default": 50, "MinValue": 20, "Description": "Root volume size." },
+    "SpotMaxPrice": { "Type": "String", "Default": "", "Description": "Optional Spot $/hr; blank = market." },
+    "InstanceNameTag": { "Type": "String", "Default": "hf-tgi-minimal-spot", "Description": "Name tag." }
+  },
+  "Conditions": {
+    "HasSpotMaxPrice": { "Fn::Not": [ { "Fn::Equals": [ { "Ref": "SpotMaxPrice" }, "" ] } ] }
+  },
+  "Resources": {
+    "Vpc": { "Type": "AWS::EC2::VPC", "Properties": { "CidrBlock": "10.9.0.0/16", "EnableDnsSupport": true, "EnableDnsHostnames": true } },
+    "Igw": { "Type": "AWS::EC2::InternetGateway" },
+    "VpcIgwAttach": { "Type": "AWS::EC2::VPCGatewayAttachment", "Properties": { "InternetGatewayId": { "Ref": "Igw" }, "VpcId": { "Ref": "Vpc" } } },
+    "PublicSubnet": { "Type": "AWS::EC2::Subnet", "Properties": { "VpcId": { "Ref": "Vpc" }, "CidrBlock": "10.9.1.0/24", "MapPublicIpOnLaunch": true } },
+    "RouteTable": { "Type": "AWS::EC2::RouteTable", "Properties": { "VpcId": { "Ref": "Vpc" } } },
+    "DefaultRoute": {
+      "Type": "AWS::EC2::Route",
+      "DependsOn": "VpcIgwAttach",
+      "Properties": { "RouteTableId": { "Ref": "RouteTable" }, "DestinationCidrBlock": "0.0.0.0/0", "GatewayId": { "Ref": "Igw" } }
+    },
+    "RtAssoc": { "Type": "AWS::EC2::SubnetRouteTableAssociation", "Properties": { "SubnetId": { "Ref": "PublicSubnet" }, "RouteTableId": { "Ref": "RouteTable" } } },
+
+    "ApiSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "VpcId": { "Ref": "Vpc" },
+        "GroupDescription": "Allow TCP/8080 (and 22 if ever needed).",
+        "SecurityGroupIngress": [
+          { "IpProtocol": "tcp", "FromPort": 8080, "ToPort": 8080, "CidrIp": { "Ref": "AllowedCidr" } },
+          { "IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "CidrIp": { "Ref": "AllowedCidr" } }
+        ],
+        "Tags": [ { "Key": "Name", "Value": { "Fn::Sub": "${InstanceNameTag}-sg" } } ]
+      }
+    },
+
+    "InstanceRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": { "Version": "2012-10-17", "Statement": [ { "Effect": "Allow", "Principal": { "Service": "ec2.amazonaws.com" }, "Action": "sts:AssumeRole" } ] },
+        "ManagedPolicyArns": [ "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" ],
+        "Path": "/"
+      }
+    },
+    "InstanceProfile": { "Type": "AWS::IAM::InstanceProfile", "Properties": { "Roles": [ { "Ref": "InstanceRole" } ], "Path": "/" } },
+
+    "LaunchTemplate": {
+      "Type": "AWS::EC2::LaunchTemplate",
+      "Properties": {
+        "LaunchTemplateName": { "Fn::Sub": "${InstanceNameTag}-lt" },
+        "LaunchTemplateData": {
+          "ImageId": { "Fn::Sub": "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}" },
+          "InstanceType": { "Ref": "InstanceType" },
+          "IamInstanceProfile": { "Arn": { "Fn::GetAtt": [ "InstanceProfile", "Arn" ] } },
+          "BlockDeviceMappings": [
+            { "DeviceName": "/dev/xvda", "Ebs": { "VolumeSize": { "Ref": "VolumeSizeGiB" }, "VolumeType": "gp3", "DeleteOnTermination": true } }
+          ],
+          "NetworkInterfaces": [
+            {
+              "DeviceIndex": 0,
+              "AssociatePublicIpAddress": true,
+              "Groups": [ { "Ref": "ApiSecurityGroup" } ]
+            }
+          ],
+          "TagSpecifications": [
+            { "ResourceType": "instance", "Tags": [ { "Key": "Name", "Value": { "Ref": "InstanceNameTag" } } ] },
+            { "ResourceType": "volume", "Tags": [ { "Key": "Name", "Value": { "Fn::Sub": "${InstanceNameTag}-root" } } ] }
+          ],
+          "UserData": {
+            "Fn::Base64": {
+              "Fn::Sub": "#!/bin/bash\nset -euxo pipefail\n# Basics + Docker (Amazon Linux 2)\nyum clean all -y || true\nyum update -y || true\namazon-linux-extras install docker -y\nsystemctl enable --now docker\n# Ensure SSM agent\nsystemctl enable --now amazon-ssm-agent || true\n# Run TGI CPU-only image with tiny model\nMODEL_ID=\"${ModelId}\"\nmkdir -p /opt/tgi-cache\n/usr/bin/docker run -d --name tgi --restart unless-stopped \\\n  -p 8080:80 \\\n  -v /opt/tgi-cache:/data \\\n  -e HF_HUB_ENABLE_HF_TRANSFER=1 \\\n  ghcr.io/huggingface/text-generation-inference:latest-intel-cpu \\\n    --model-id \"$MODEL_ID\" \\\n    --hostname 0.0.0.0 \\\n    --port 80\n# Wait for health\nfor i in {1..60}; do\n  sleep 5\n  if curl -fsS http://localhost:8080/health >/dev/null; then\n    echo \"TGI is healthy\"; exit 0\n  fi\n  echo \"waiting for TGI... ($i)\"\ndone\n/usr/bin/docker logs --tail=200 tgi || true\nexit 0\n"
+            }
+          }
+        }
+      }
+    },
+
+    "Asg": {
+      "Type": "AWS::AutoScaling::AutoScalingGroup",
+      "Properties": {
+        "VPCZoneIdentifier": [ { "Ref": "PublicSubnet" } ],
+        "MinSize": "1",
+        "MaxSize": "1",
+        "DesiredCapacity": "1",
+        "MixedInstancesPolicy": {
+          "LaunchTemplate": {
+            "LaunchTemplateSpecification": {
+              "LaunchTemplateId": { "Ref": "LaunchTemplate" },
+              "Version": { "Fn::GetAtt": [ "LaunchTemplate", "LatestVersionNumber" ] }
+            },
+            "Overrides": [ { "InstanceType": { "Ref": "InstanceType" } } ]
+          },
+          "InstancesDistribution": {
+            "OnDemandPercentageAboveBaseCapacity": 0,
+            "SpotMaxPrice": { "Fn::If": [ "HasSpotMaxPrice", { "Ref": "SpotMaxPrice" }, { "Ref": "AWS::NoValue" } ] }
+          }
+        },
+        "HealthCheckType": "EC2",
+        "HealthCheckGracePeriod": 120,
+        "Tags": [
+          { "Key": "Name", "Value": { "Ref": "InstanceNameTag" }, "PropagateAtLaunch": true }
+        ]
+      }
+    }
+  },
+  "Outputs": {
+    "HowToFindPublicIP": {
+      "Description": "Go to EC2 > Instances, filter by tag Name=hf-tgi-minimal-spot and copy Public IPv4. The API listens on :8080.",
+      "Value": "EC2 console → Instances → find the single instance in this stack and copy Public IPv4 → open http://<PublicIPv4>:8080/health"
+    },
+    "TestCurlExample": {
+      "Description": "Example command once you have the IP",
+      "Value": "curl -s http://<PublicIPv4>:8080/generate -H \"Content-Type: application/json\" -d '{\"inputs\":\"Say hello from Manama.\",\"parameters\":{\"max_new_tokens\":32}}'"
+    }
+  }
+}
